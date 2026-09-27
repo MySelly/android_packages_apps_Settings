@@ -3439,6 +3439,13 @@
             android:enableOnBackInvokedCallback="false"
             android:windowSoftInputMode="stateVisible|adjustResize"/>
 
+        <!-- No windowSoftInputMode: the Knock Code is entered by tapping, so raising the IME
+             would cover the grid the user has to reach. -->
+        <activity android:name=".password.ChooseLockKnockCode"
+            android:exported="false"
+            android:theme="@style/GlifTheme.Light"
+            android:enableOnBackInvokedCallback="false"/>
+
         <activity
             android:name=".Settings$StorageDashboardActivity"
             android:label="@string/storage_settings"

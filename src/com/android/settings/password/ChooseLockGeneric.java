@@ -143,6 +143,16 @@ public class ChooseLockGeneric extends SettingsActivity {
         private static final String KEY_SKIP_FINGERPRINT = "unlock_skip_fingerprint";
         private static final String KEY_SKIP_FACE = "unlock_skip_face";
         private static final String KEY_SKIP_BIOMETRICS = "unlock_skip_biometrics";
+
+        /**
+         * Picker key for Knock Code. It is not a {@link ScreenLockType} because it is not a
+         * distinct credential type: a Knock Code is stored as a PIN, so it shares PIN's quality in
+         * every mapping the enum feeds - {@code fromQuality}, admin policy checks, encryption
+         * reporting. Adding it to the enum would mean teaching all of those about a value that is
+         * not actually different, so it is handled as a separate picker entry that routes to
+         * {@link ChooseLockKnockCode} instead.
+         */
+        private static final String KEY_UNLOCK_SET_KNOCK_CODE = "unlock_set_knock_code";
         private static final String PASSWORD_CONFIRMED = "password_confirmed";
         private static final String WAITING_FOR_CONFIRMATION = "waiting_for_confirmation";
         public static final String HIDE_INSECURE_OPTIONS = "hide_insecure_options";
@@ -237,6 +247,14 @@ public class ChooseLockGeneric extends SettingsActivity {
 
         private final ArrayList<AbstractPreferenceController> mUnlockSettingsControllers =
                 new ArrayList<>();
+
+        /**
+         * Set for the duration of one {@link #setUnlockMethod} call, so that
+         * {@link #getIntentForUnlockMethod} knows to open {@link ChooseLockKnockCode} rather than
+         * {@link ChooseLockPassword} for what is otherwise an identical PIN-quality request.
+         * Consumed on read.
+         */
+        private boolean mLaunchKnockCodeEnrollment;
 
         @Override
         public int getMetricsCategory() {
@@ -854,6 +872,12 @@ public class ChooseLockGeneric extends SettingsActivity {
             ScreenLockType lock =
                     ScreenLockType.fromQuality(
                             mLockPatternUtils.getKeyguardStoredPasswordQuality(credentialOwner));
+            // A Knock Code reports the same stored quality as a PIN, so the stored quality alone
+            // cannot say which of the two is in force; the marker is what distinguishes them.
+            if (lock == ScreenLockType.PIN
+                    && mLockPatternUtils.isKnockCodeEnabled(credentialOwner)) {
+                return KEY_UNLOCK_SET_KNOCK_CODE;
+            }
             return lock != null ? lock.preferenceKey : null;
         }
 
@@ -880,6 +904,17 @@ public class ChooseLockGeneric extends SettingsActivity {
                     }
                 }
             }
+
+            // Knock Code is stored as a PIN, so it is usable exactly when PIN is: an admin who has
+            // hidden or blocked the PIN entry has blocked this too, whether or not they know the
+            // feature exists. Removing the entry rather than disabling it matches how the other
+            // unusable methods disappear, and avoids advertising a method the policy forbids.
+            final Preference knockCode = findPreference(KEY_UNLOCK_SET_KNOCK_CODE);
+            if (knockCode != null
+                    && (!mController.isScreenLockVisible(ScreenLockType.PIN)
+                            || !mController.isScreenLockEnabled(ScreenLockType.PIN))) {
+                entries.removePreference(knockCode);
+            }
         }
 
         protected Intent getLockManagedPasswordIntent(LockscreenCredential password) {
@@ -904,6 +939,25 @@ public class ChooseLockGeneric extends SettingsActivity {
                                 ChooseLockPassword.EXTRA_KEY_FOR_SUPERVISION_RESET,
                                 false));
             }
+            if (mUserPassword != null) {
+                builder.setPassword(mUserPassword);
+            }
+            if (mUnificationProfileId != UserHandle.USER_NULL) {
+                builder.setProfileToUnify(mUnificationProfileId, mUnificationProfileCredential);
+            }
+            return builder.build();
+        }
+
+        /**
+         * The enrollment screen for a Knock Code. Deliberately does not carry a password
+         * requirement: a tap sequence cannot express one, and callers that need more than a PIN
+         * are routed to {@link ChooseLockPassword} before reaching here.
+         */
+        protected Intent getLockKnockCodeIntent(int quality) {
+            ChooseLockKnockCode.IntentBuilder builder =
+                    new ChooseLockKnockCode.IntentBuilder(getContext())
+                            .setUserId(mUserId)
+                            .setRequestGatekeeperPasswordHandle(mRequestGatekeeperPasswordHandle);
             if (mUserPassword != null) {
                 builder.setPassword(mUserPassword);
             }
@@ -988,11 +1042,24 @@ public class ChooseLockGeneric extends SettingsActivity {
         }
 
         private Intent getIntentForUnlockMethod(int quality) {
+            // Read and clear together: this is the only place the request is honoured, and a flag
+            // left standing after a quality upgrade sent the user to a password screen instead
+            // would silently redirect the next unrelated change to the tap grid.
+            final boolean knockCodeRequested = mLaunchKnockCodeEnrollment;
+            mLaunchKnockCodeEnrollment = false;
+
             Intent intent = null;
             if (quality >= DevicePolicyManager.PASSWORD_QUALITY_MANAGED) {
                 intent = getLockManagedPasswordIntent(mUserPassword);
-            } else if (quality >= DevicePolicyManager.PASSWORD_QUALITY_NUMERIC) {
+            } else if (quality >= DevicePolicyManager.PASSWORD_QUALITY_ALPHABETIC) {
+                // An admin or caller demanded more than a PIN's worth of entropy, which a Knock
+                // Code cannot provide - its alphabet is four taps. Fall through to the password
+                // screen rather than offering a code that would not satisfy the requirement.
                 intent = getLockPasswordIntent(quality);
+            } else if (quality >= DevicePolicyManager.PASSWORD_QUALITY_NUMERIC) {
+                intent = knockCodeRequested
+                        ? getLockKnockCodeIntent(quality)
+                        : getLockPasswordIntent(quality);
             } else if (quality == DevicePolicyManager.PASSWORD_QUALITY_SOMETHING) {
                 intent = getLockPatternIntent();
             }
@@ -1151,6 +1218,19 @@ public class ChooseLockGeneric extends SettingsActivity {
 
         private boolean setUnlockMethod(String unlockMethod) {
             EventLog.writeEvent(EventLogTags.LOCK_SCREEN_TYPE, unlockMethod);
+
+            if (KEY_UNLOCK_SET_KNOCK_CODE.equals(unlockMethod)) {
+                // A Knock Code is stored as a PIN, so it takes PIN's path through the quality
+                // checks and admin policy. Carrying PIN's quality is what makes it acceptable
+                // wherever a PIN is; mLaunchKnockCodeEnrollment only decides which screen collects
+                // the digits.
+                mLaunchKnockCodeEnrollment = true;
+                updateUnlockMethodAndFinish(
+                        DevicePolicyManager.PASSWORD_QUALITY_NUMERIC,
+                        false /* disabled */,
+                        false /* chooseLockSkipped */);
+                return true;
+            }
 
             ScreenLockType lock = ScreenLockType.fromKey(unlockMethod);
             if (lock != null) {
